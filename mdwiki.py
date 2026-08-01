@@ -10,15 +10,19 @@ and no network access.
 
 Features
     * Recursive Markdown discovery, mirrored folder structure in the output.
-    * Wikipedia (Vector-skin) look: sidebar, article tabs, contents box, wikitables,
-      category links, "Pages that link here", light/dark themes.
+    * Current Wikipedia (Vector 2022) look: a horizontally centred page container
+      capped at 1596px, a collapsible navigation menu and sticky table of contents
+      in the left column, the article capped at 960px for readability, and a right
+      column holding page tools plus an Appearance panel (text size, content width,
+      colour scheme). Also wikitables, category links, "Pages that link here".
     * Wiki-style linking: [[Page Name]] / [[Page Name|label]] plus ordinary
       relative Markdown links (`../guide/intro.md#setup` is rewritten to
       `../guide/intro.html#setup`). Unresolved links render as red "new" links.
     * YAML-ish front matter for title / description / categories.
     * Auto-generated main page, folder indexes, all-pages index, category pages.
     * Client-side search over a generated JS index (works on file:// because it
-      is loaded with a <script> tag rather than fetch()).
+      is loaded with a <script> tag rather than fetch()), with a scroll-spy that
+      tracks the current section in the contents list.
     * Zero required dependencies. If the `markdown` package is installed it is
       used for higher fidelity; otherwise a built-in Markdown subset renderer runs.
 """
@@ -39,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 MARKDOWN_SUFFIXES = {".md", ".markdown", ".mdown", ".mkd", ".mkdn"}
 SKIP_DIR_NAMES = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv"}
@@ -1181,46 +1185,60 @@ class SiteBuilder:
         body = re.sub(r"<h([1-6])((?:\s[^>]*)?)>(.*?)</h\1>", repl, body, flags=re.S | re.I)
         return body, headings
 
+    # -- contents (left column, sticky) ------------------------------------ #
+
     def _toc(self, page: Page) -> str:
-        if self.args.no_toc or len(page.headings) < self.args.toc_min:
+        if self.args.no_toc:
             return ""
         entries = [h for h in page.headings if h[0] <= self.args.toc_depth + 1]
         if len(entries) < self.args.toc_min:
             return ""
+        items = self._toc_items(self._toc_tree(entries), 1)
+        return (
+            '<nav id="toc" class="sidebar-toc" aria-labelledby="toc-heading">'
+            '<div class="sidebar-toc-head">'
+            '<h2 id="toc-heading">Contents</h2>'
+            '<button type="button" class="toc-visibility" data-action="toggle-toc"'
+            ' aria-expanded="true" aria-controls="toc-list">hide</button>'
+            "</div>"
+            '<ul id="toc-list" class="toc-list">'
+            '<li class="toc-item toc-top"><a class="toc-link" href="#">(Top)</a></li>'
+            f"{items}</ul></nav>"
+        )
 
-        out = ['<div id="toc" class="toc" role="navigation" aria-labelledby="toc-heading">',
-               '<div class="toctitle"><h2 id="toc-heading">Contents</h2>',
-               '<span class="toctogglespan">[<button type="button" class="toctogglebutton" '
-               'data-action="toggle-toc" aria-expanded="true">hide</button>]</span></div>',
-               '<ul class="toc-list">']
-        levels: list[int] = []
-        counters: list[int] = []
+    @staticmethod
+    def _toc_tree(entries: list[tuple[int, str, str]]) -> list[dict]:
+        """Turn a flat heading list into a nested tree keyed on heading level."""
+        root: list[dict] = []
+        stack: list[tuple[int, list]] = [(0, root)]
         for level, ident, text in entries:
-            while levels and level < levels[-1]:
-                levels.pop()
-                counters.pop()
-                out.append("</ul></li>")
-            if levels and level > levels[-1]:
-                out[-1] = out[-1][:-5] if out[-1].endswith("</li>") else out[-1]
-                out.append("<ul>")
-                levels.append(level)
-                counters.append(0)
-            elif not levels:
-                levels.append(level)
-                counters.append(0)
-            counters[-1] += 1
-            number = ".".join(str(c) for c in counters)
+            while len(stack) > 1 and level <= stack[-1][0]:
+                stack.pop()
+            node = {"id": ident, "text": text, "children": []}
+            stack[-1][1].append(node)
+            stack.append((level, node["children"]))
+        return root
+
+    def _toc_items(self, nodes: list[dict], depth: int) -> str:
+        out: list[str] = []
+        for node in nodes:
+            ident, text = esc(node["id"]), esc(node["text"])
+            children = self._toc_items(node["children"], depth + 1) if node["children"] else ""
+            state = ' data-expanded="false"' if children else ""
+            out.append(f'<li class="toc-item toc-depth-{depth}"{state}>')
             out.append(
-                f'<li class="toclevel-{len(levels)}"><a href="#{esc(ident)}">'
-                f'<span class="tocnumber">{number}</span> '
-                f'<span class="toctext">{esc(text)}</span></a></li>'
+                f'<a class="toc-link" href="#{ident}"><span class="toc-text">{text}</span></a>'
             )
-        while len(levels) > 1:
-            levels.pop()
-            counters.pop()
-            out.append("</ul></li>")
-        out.append("</ul></div>")
-        return "\n".join(out)
+            if children:
+                out.append(
+                    '<button type="button" class="toc-expand" aria-expanded="false"'
+                    f' aria-label="Show subsections of {text}"></button>'
+                    f'<ul class="toc-sublist">{children}</ul>'
+                )
+            out.append("</li>")
+        return "".join(out)
+
+    # -- content furniture ------------------------------------------------- #
 
     def _breadcrumbs(self, page: Page) -> str:
         if page.kind == "main":
@@ -1242,7 +1260,8 @@ class SiteBuilder:
             crumbs.append("Special pages")
         if len(crumbs) == 1:
             return ""
-        return '<div id="contentSub" class="breadcrumbs">' + ' <span class="crumb-sep">&#8250;</span> '.join(crumbs) + "</div>"
+        joined = ' <span class="crumb-sep">&#8250;</span> '.join(crumbs)
+        return f'<div id="contentSub" class="breadcrumbs">{joined}</div>'
 
     def _catlinks(self, page: Page) -> str:
         if not page.categories:
@@ -1252,7 +1271,8 @@ class SiteBuilder:
         for name in page.categories:
             cat = self.category_pages.get(name)
             links.append(
-                f'<li><a href="{esc(cat.link_from(from_dir))}">{esc(name)}</a></li>' if cat else f"<li>{esc(name)}</li>"
+                f'<li><a href="{esc(cat.link_from(from_dir))}">{esc(name)}</a></li>'
+                if cat else f"<li>{esc(name)}</li>"
             )
         return (
             '<div id="catlinks" class="catlinks"><div class="catlinks-inner">'
@@ -1263,31 +1283,61 @@ class SiteBuilder:
     def _backlinks_box(self, page: Page) -> str:
         if self.args.no_backlinks:
             return ""
-        sources = sorted(self.backlinks.get(page.out_path, set()))
-        sources = [s for s in sources if s != page.out_path]
+        sources = sorted(s for s in self.backlinks.get(page.out_path, set()) if s != page.out_path)
         if not sources:
             return ""
         from_dir = page.out_dir
         items = []
         for out_path in sources:
             other = self.by_output.get(out_path)
-            if not other:
-                continue
-            items.append(f'<li><a href="{esc(other.link_from(from_dir))}">{esc(other.title)}</a></li>')
+            if other:
+                items.append(f'<li><a href="{esc(other.link_from(from_dir))}">{esc(other.title)}</a></li>')
         if not items:
             return ""
         return (
-            '<details class="whatlinkshere">'
+            '<details id="whatlinkshere" class="whatlinkshere">'
             f"<summary>Pages that link here ({len(items)})</summary>"
             f'<ul class="page-list columns">{"".join(items)}</ul>'
             "</details>"
         )
 
-    def _sidebar(self, page: Page) -> str:
-        from_dir = page.out_dir
+    # -- header, menus, columns -------------------------------------------- #
+
+    def _search_form(self, page: Page) -> str:
+        return (
+            '<div id="p-search" class="header-search" role="search">'
+            '<label class="visually-hidden" for="searchInput">Search this wiki</label>'
+            '<div class="search-field">'
+            '<input type="search" id="searchInput" autocomplete="off" spellcheck="false"'
+            ' placeholder="Search this wiki" aria-controls="searchResults" aria-expanded="false">'
+            "</div>"
+            '<ul id="searchResults" class="search-results" role="listbox" hidden></ul>'
+            "</div>"
+        )
+
+    def _header(self, page: Page) -> str:
         base = ("../" * page.depth) or ""
+        home = esc(self.main_page.link_from(page.out_dir))
+        brand_sub = (
+            f'<span class="brand-tagline">{esc(self.args.brand_tagline)}</span>'
+            if self.args.brand_tagline else ""
+        )
+        return (
+            '<header class="site-header">'
+            '<button type="button" class="header-menu" data-action="menu" aria-controls="site-nav"'
+            ' aria-expanded="false" aria-label="Main menu"><span class="hamburger"></span></button>'
+            f'<a class="header-brand" href="{home}">'
+            f'<img src="{esc(base)}assets/logo.svg" alt="" width="44" height="44">'
+            f'<span class="brand-text"><span class="brand-name">{esc(self.args.site_name)}</span>'
+            f"{brand_sub}</span></a>"
+            f"{self._search_form(page)}"
+            "</header>"
+        )
+
+    def _main_menu(self, page: Page) -> str:
+        from_dir = page.out_dir
         nav = [
-            ('<div class="portal"><h3>Navigation</h3><ul>'),
+            '<div class="portal"><h3>Navigation</h3><ul>',
             f'<li><a href="{esc(self.main_page.link_from(from_dir))}">Main page</a></li>',
             f'<li><a href="{esc(self.all_pages_page.link_from(from_dir))}">All pages</a></li>',
             f'<li><a href="{esc(self.categories_page.link_from(from_dir))}">Categories</a></li>',
@@ -1302,63 +1352,90 @@ class SiteBuilder:
             for rel_dir, folder in folders:
                 open_here = current == rel_dir or current.startswith(rel_dir + "/")
                 active = ' class="active"' if open_here else ""
-                nav.append(f'<li{active}><a href="{esc(folder.link_from(from_dir))}">{esc(folder.title)}</a>')
+                nav.append(
+                    f'<li{active}><a href="{esc(folder.link_from(from_dir))}">{esc(folder.title)}</a>'
+                )
                 if open_here:
                     children, subfolders = self._child_pages(rel_dir)
                     if children or subfolders:
                         nav.append('<ul class="subnav">')
                         for _, sub in subfolders:
-                            nav.append(f'<li><a href="{esc(sub.link_from(from_dir))}">{esc(sub.title)}</a></li>')
+                            nav.append(
+                                f'<li><a href="{esc(sub.link_from(from_dir))}">{esc(sub.title)}</a></li>'
+                            )
                         for child in children:
                             mark = ' class="active"' if child.out_path == page.out_path else ""
-                            nav.append(f'<li{mark}><a href="{esc(child.link_from(from_dir))}">{esc(child.title)}</a></li>')
+                            nav.append(
+                                f'<li{mark}><a href="{esc(child.link_from(from_dir))}">{esc(child.title)}</a></li>'
+                            )
                         nav.append("</ul>")
                 nav.append("</li>")
             for child in root_files[:15]:
                 mark = ' class="active"' if child.out_path == page.out_path else ""
-                nav.append(f'<li{mark}><a href="{esc(child.link_from(from_dir))}">{esc(child.title)}</a></li>')
+                nav.append(
+                    f'<li{mark}><a href="{esc(child.link_from(from_dir))}">{esc(child.title)}</a></li>'
+                )
             nav.append("</ul></div>")
 
-        nav.append(
-            '<div class="portal"><h3>Tools</h3><ul>'
-            '<li><a href="#" data-action="print">Printable version</a></li>'
-            '<li><a href="#" data-action="theme">Toggle dark mode</a></li>'
-            "</ul></div>"
-        )
-        logo = base + "assets/logo.svg"
-        return (
-            '<div id="mw-panel" class="sidebar">'
-            f'<a id="p-logo" href="{esc(self.main_page.link_from(from_dir))}" title="Visit the main page">'
-            f'<img src="{esc(logo)}" alt="" width="90" height="90"></a>'
-            f'<div class="site-name"><a href="{esc(self.main_page.link_from(from_dir))}">{esc(self.args.site_name)}</a></div>'
-            + "".join(nav)
-            + "</div>"
-        )
+        return f'<nav id="site-nav" class="main-menu">{"".join(nav)}</nav>'
 
-    def _tabs(self, page: Page, has_toc: bool) -> str:
-        tabs = ['<li class="selected"><span>Article</span></li>']
+    def _tabs(self, page: Page) -> str:
+        label = {"main": "Main page", "folder": "Index", "special": "Special page"}.get(page.kind, "Article")
+        left = f'<li class="selected"><span>{esc(label)}</span></li>'
+        right = []
         if page.source_copy:
-            tabs.append(
+            right.append(
                 f'<li><a href="{esc(rel_url(page.out_dir, page.source_copy))}">View source</a></li>'
             )
-        actions = ['<li><a href="#" data-action="print">Print</a></li>']
-        if has_toc:
-            actions.insert(0, '<li><a href="#toc">Contents</a></li>')
+        right.append('<li><a href="#" data-action="print">Print</a></li>')
         return (
-            '<div id="left-navigation"><ul class="tabs">' + "".join(tabs) + "</ul></div>"
-            '<div id="right-navigation"><ul class="tabs actions">' + "".join(actions) + "</ul></div>"
-        )
-
-    def _search_form(self, page: Page) -> str:
-        return (
-            '<div id="p-search" class="search" role="search">'
-            '<label class="visually-hidden" for="searchInput">Search this wiki</label>'
-            '<input type="search" id="searchInput" autocomplete="off" spellcheck="false" '
-            'placeholder="Search this wiki" aria-controls="searchResults" aria-expanded="false">'
-            '<button type="button" id="searchButton" data-action="search">Search</button>'
-            '<ul id="searchResults" class="search-results" role="listbox" hidden></ul>'
+            '<div class="content-tabs">'
+            f'<ul class="tabs tabs-namespace">{left}</ul>'
+            f'<ul class="tabs tabs-actions">{"".join(right)}</ul>'
             "</div>"
         )
+
+    def _column_end(self, page: Page, has_toc: bool) -> str:
+        from_dir = page.out_dir
+        tools = []
+        if page.source_copy:
+            tools.append(
+                f'<li><a href="{esc(rel_url(page.out_dir, page.source_copy))}">View source</a></li>'
+            )
+        tools.append('<li><a href="#" data-action="print">Printable version</a></li>')
+        if not self.args.no_backlinks and self.backlinks.get(page.out_path):
+            tools.append('<li><a href="#whatlinkshere">Pages that link here</a></li>')
+        tools.append('<li><a href="#" data-action="random">Random page</a></li>')
+        tools.append(f'<li><a href="{esc(self.all_pages_page.link_from(from_dir))}">All pages</a></li>')
+
+        def group(name: str, key: str, options: list[tuple[str, str]], default: str) -> str:
+            buttons = []
+            for value, text in options:
+                checked = "true" if value == default else "false"
+                buttons.append(
+                    f'<button type="button" role="radio" aria-checked="{checked}"'
+                    f' data-set="{esc(key)}" data-value="{esc(value)}">{esc(text)}</button>'
+                )
+            return (
+                f'<div class="appearance-group" role="radiogroup" aria-label="{esc(name)}">'
+                f'<span class="appearance-label">{esc(name)}</span>'
+                f'<div class="appearance-options">{"".join(buttons)}</div></div>'
+            )
+
+        appearance = (
+            '<div class="column-panel appearance"><h3>Appearance</h3>'
+            + group("Text", "textsize", [("small", "Small"), ("standard", "Standard"), ("large", "Large")], "standard")
+            + group("Width", "width", [("standard", "Standard"), ("wide", "Wide")], "standard")
+            + group("Colour", "theme", [("auto", "Automatic"), ("light", "Light"), ("dark", "Dark")], self.args.theme)
+            + "</div>"
+        )
+        return (
+            '<div class="column-end">'
+            f'<div class="column-panel"><h3>Tools</h3><ul>{"".join(tools)}</ul></div>'
+            f"{appearance}</div>"
+        )
+
+    # -- page shell -------------------------------------------------------- #
 
     def _shell(self, page: Page) -> str:
         base = ("../" * page.depth) or ""
@@ -1374,9 +1451,14 @@ class SiteBuilder:
 
         title_suffix = "" if page.kind == "main" else f" &#8212; {esc(self.args.site_name)}"
         theme_attr = f' data-theme="{esc(self.args.theme)}"' if self.args.theme in ("light", "dark") else ""
+        toc_button = (
+            '<button type="button" class="toc-mobile" data-action="mobile-toc"'
+            ' aria-controls="toc" aria-expanded="false">Contents</button>'
+            if toc else ""
+        )
 
         return f"""<!DOCTYPE html>
-<html lang="{esc(self.args.lang)}"{theme_attr}>
+<html lang="{esc(self.args.lang)}"{theme_attr} data-textsize="standard" data-width="standard">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1386,30 +1468,35 @@ class SiteBuilder:
 <link rel="stylesheet" href="{esc(base)}assets/wiki.css">
 <link rel="icon" href="{esc(base)}assets/logo.svg" type="image/svg+xml">
 </head>
-<body class="page-{esc(page.kind)}" data-base="{esc(base)}" data-page="{esc(page.out_path)}">
+<body class="page-{esc(page.kind)}{'' if toc else ' no-toc'}" data-base="{esc(base)}" data-page="{esc(page.out_path)}">
 <a class="visually-hidden skip-link" href="#mw-content-text">Skip to content</a>
-<div id="mw-page-base"></div>
-<div class="layout">
-{self._sidebar(page)}
-<div class="content-column">
-<div id="mw-head">
-<button type="button" class="menu-toggle" data-action="menu" aria-label="Show navigation">&#9776;</button>
-{self._search_form(page)}
+<div class="page-container">
+{self._header(page)}
+<div class="page-grid">
+<div class="column-start">
+{self._main_menu(page)}
+{toc}
 </div>
-{self._tabs(page, bool(toc))}
+<div class="column-content">
+{self._tabs(page)}
 <main id="content" class="mw-body">
+<div class="content-header">
 <h1 id="firstHeading" class="firstHeading">{esc(page.title)}</h1>
 <div id="siteSub">{esc(self.args.tagline)}</div>
+{toc_button}
+</div>
 {self._breadcrumbs(page)}
 <div id="mw-content-text" class="mw-parser-output">
-{toc}
 {page.body}
 </div>
 {self._catlinks(page)}
 {self._backlinks_box(page)}
 <div class="printfooter">Retrieved from &#8220;{esc(page.out_path)}&#8221;</div>
 </main>
-<footer id="footer">
+</div>
+{self._column_end(page, bool(toc))}
+</div>
+<footer id="footer" class="site-footer">
 <p>{" ".join(footer_bits)}</p>
 <ul class="footer-links">
 <li><a href="{esc(self.main_page.link_from(page.out_dir))}">Main page</a></li>
@@ -1417,7 +1504,6 @@ class SiteBuilder:
 <li><a href="#" data-action="theme">Toggle dark mode</a></li>
 </ul>
 </footer>
-</div>
 </div>
 <script src="{esc(base)}assets/search-index.js"></script>
 <script src="{esc(base)}assets/wiki.js"></script>
@@ -1481,156 +1567,248 @@ LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" widt
 </svg>
 """
 
-STYLESHEET = """/* mdwiki - Wikipedia-flavoured stylesheet. Static, no webfonts, works on file://. */
+STYLESHEET = """/* mdwiki - Wikipedia-flavoured stylesheet (centred Vector-2022 layout).
+   Static, no webfonts, no network access, works from file://. */
 :root {
-  --page-bg: #f6f6f6;
-  --body-bg: #ffffff;
-  --text: #202122;
-  --text-muted: #54595d;
-  --border: #a2a9b1;
-  --border-soft: #c8ccd1;
-  --border-accent: #a7d7f9;
-  --panel-bg: #f8f9fa;
-  --shade: #eaecf0;
-  --link: #3366cc;
-  --link-visited: #795cb2;
-  --link-new: #d73333;
-  --link-external: #3366cc;
+  --color-base: #202122;
+  --color-subtle: #54595d;
+  --color-link: #3366cc;
+  --color-link-visited: #6b4ba1;
+  --color-link-new: #d73333;
+  --border-base: #a2a9b1;
+  --border-subtle: #c8ccd1;
+  --border-muted: #eaecf0;
+  --bg-page: #ffffff;
+  --bg-container: #f8f9fa;
+  --bg-interactive: #eaecf0;
+  --bg-code: #f8f9fa;
+  --accent: #3366cc;
   --selection: #cfe4ff;
+  --shadow-drop: rgba(0, 0, 0, 0.14);
+  --width-layout: 1596px;
+  --width-content: 60rem;
+  --col-start: 13.75rem;
+  --col-end: 15rem;
+  --gap-col: 1.75rem;
+  --font-size-content: 0.875rem;
   --serif: "Linux Libertine", "Georgia", "Times New Roman", Times, serif;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: "DejaVu Sans Mono", "SFMono-Regular", Menlo, Consolas, monospace;
 }
+html[data-textsize="small"] { --font-size-content: 0.8125rem; }
+html[data-textsize="large"] { --font-size-content: 1rem; }
+html[data-width="wide"] { --width-content: 100%; --width-layout: 100%; }
+
 html[data-theme="dark"] {
-  --page-bg: #101418;
-  --body-bg: #1b1f24;
-  --text: #e8eaed;
-  --text-muted: #a2a9b1;
-  --border: #4a5058;
-  --border-soft: #3a4048;
-  --border-accent: #35526e;
-  --panel-bg: #23272d;
-  --shade: #2a2f36;
-  --link: #7cb0ff;
-  --link-visited: #b9a3e3;
-  --link-new: #ff8a80;
+  --color-base: #f8f9fa;
+  --color-subtle: #a2a9b1;
+  --color-link: #88a3e8;
+  --color-link-visited: #b397dd;
+  --color-link-new: #ff8a80;
+  --border-base: #54595d;
+  --border-subtle: #43484d;
+  --border-muted: #33383d;
+  --bg-page: #101418;
+  --bg-container: #27292d;
+  --bg-interactive: #33383d;
+  --bg-code: #27292d;
+  --accent: #88a3e8;
   --selection: #2f4a6b;
+  --shadow-drop: rgba(0, 0, 0, 0.5);
 }
-@media (prefers-color-scheme: dark) {
+@media screen and (prefers-color-scheme: dark) {
   html:not([data-theme="light"]) {
-    --page-bg: #101418; --body-bg: #1b1f24; --text: #e8eaed; --text-muted: #a2a9b1;
-    --border: #4a5058; --border-soft: #3a4048; --border-accent: #35526e;
-    --panel-bg: #23272d; --shade: #2a2f36; --link: #7cb0ff; --link-visited: #b9a3e3;
-    --link-new: #ff8a80; --selection: #2f4a6b;
+    --color-base: #f8f9fa; --color-subtle: #a2a9b1; --color-link: #88a3e8;
+    --color-link-visited: #b397dd; --color-link-new: #ff8a80; --border-base: #54595d;
+    --border-subtle: #43484d; --border-muted: #33383d; --bg-page: #101418;
+    --bg-container: #27292d; --bg-interactive: #33383d; --bg-code: #27292d;
+    --accent: #88a3e8; --selection: #2f4a6b; --shadow-drop: rgba(0, 0, 0, 0.5);
   }
 }
+
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
 body {
-  margin: 0; background: var(--page-bg); color: var(--text);
-  font-family: var(--sans); font-size: 14px; line-height: 1.6;
+  margin: 0; background: var(--bg-container); color: var(--color-base);
+  font-family: var(--sans); font-size: 0.875rem; line-height: 1.6;
 }
 ::selection { background: var(--selection); }
-#mw-page-base {
-  height: 5em; background: var(--body-bg);
-  background-image: linear-gradient(to bottom, var(--body-bg) 50%, var(--page-bg) 100%);
-  position: absolute; top: 0; left: 0; right: 0; z-index: 0;
+a { color: var(--color-link); text-decoration: none; }
+a:visited { color: var(--color-link-visited); }
+a:hover { text-decoration: underline; }
+a:focus-visible, button:focus-visible, summary:focus-visible, input:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
 }
-.layout { position: relative; z-index: 1; display: flex; align-items: flex-start; gap: 0; }
 
-/* ---------- sidebar ---------- */
-.sidebar { flex: 0 0 11.5em; padding: 0.6em 0.8em 2em 0.8em; font-size: 0.875em; }
-#p-logo { display: block; text-align: center; margin: 0.4em 0 0.2em; }
-#p-logo img { width: 90px; height: 90px; }
-.site-name { text-align: center; font-family: var(--serif); font-size: 1.15em; margin-bottom: 1.4em; }
-.site-name a { color: var(--text); text-decoration: none; }
-.portal { margin: 0 0 1.2em; }
-.portal h3 {
-  font-size: 0.86em; font-weight: normal; color: var(--text-muted);
-  margin: 0 0 0.35em; padding-bottom: 0.2em; border-bottom: 1px solid var(--border-soft);
-  text-transform: none;
+/* ---------- centred page container ---------- */
+.page-container {
+  max-width: var(--width-layout); margin: 0 auto; background: var(--bg-page);
+  border-left: 1px solid var(--border-muted); border-right: 1px solid var(--border-muted);
+  min-height: 100vh;
 }
-.portal ul { list-style: none; margin: 0; padding: 0; }
-.portal li { margin: 0.25em 0; line-height: 1.4; }
-.portal .subnav { margin: 0.2em 0 0.4em 0.9em; border-left: 1px solid var(--border-soft); padding-left: 0.6em; }
-.portal li.active > a { font-weight: bold; color: var(--text); }
+.page-grid {
+  display: grid; align-items: start; gap: 0 var(--gap-col);
+  grid-template-columns: var(--col-start) minmax(0, 1fr) var(--col-end);
+  padding: 0 1.75rem 2rem;
+}
+.column-content { min-width: 0; max-width: var(--width-content); }
 
-/* ---------- head ---------- */
-.content-column { flex: 1 1 auto; min-width: 0; }
-#mw-head { display: flex; align-items: center; justify-content: flex-end; gap: 0.5em; padding: 0.55em 1em 0 0; min-height: 2.6em; }
-.menu-toggle { display: none; }
-.search { position: relative; display: flex; gap: 0.35em; }
-.search input[type="search"] {
-  width: 13.2em; max-width: 42vw; padding: 0.35em 0.5em; font: inherit; font-size: 0.9em;
-  color: var(--text); background: var(--body-bg);
-  border: 1px solid var(--border-soft); border-radius: 2px;
+/* ---------- header ---------- */
+.site-header {
+  position: sticky; top: 0; z-index: 30; display: flex; align-items: center;
+  gap: 0.9rem; padding: 0.55rem 1.75rem; background: var(--bg-page);
+  border-bottom: 1px solid var(--border-muted);
 }
-.search input[type="search"]:focus { outline: 2px solid var(--link); outline-offset: -1px; border-color: var(--link); }
-.search button {
-  padding: 0.35em 0.7em; font: inherit; font-size: 0.9em; cursor: pointer;
-  color: var(--text); background: var(--panel-bg);
-  border: 1px solid var(--border-soft); border-radius: 2px;
+.site-header.scrolled { box-shadow: 0 1px 4px var(--shadow-drop); }
+.header-menu {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 2.25rem; height: 2.25rem; padding: 0; cursor: pointer;
+  background: transparent; border: 1px solid transparent; border-radius: 2px;
 }
-.search button:hover { background: var(--shade); }
+.header-menu:hover { background: var(--bg-container); }
+.hamburger, .hamburger::before, .hamburger::after {
+  display: block; width: 1.05rem; height: 2px; background: var(--color-subtle); content: "";
+}
+.hamburger { position: relative; }
+.hamburger::before { position: absolute; top: -5px; }
+.hamburger::after { position: absolute; top: 5px; }
+.header-brand { display: flex; align-items: center; gap: 0.6rem; color: inherit; }
+.header-brand:hover { text-decoration: none; }
+.header-brand img { width: 2.5rem; height: 2.5rem; }
+.brand-text { display: flex; flex-direction: column; line-height: 1.2; }
+.brand-name { font-family: var(--serif); font-size: 1.3rem; }
+.brand-tagline {
+  font-size: 0.6875rem; color: var(--color-subtle);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+
+/* ---------- search ---------- */
+.header-search { position: relative; flex: 1 1 auto; max-width: 30rem; }
+.search-field { position: relative; }
+.search-field::before {
+  content: ""; position: absolute; left: 0.6rem; top: 50%; width: 1rem; height: 1rem;
+  margin-top: -0.5rem; opacity: 0.6; background: var(--color-subtle);
+  -webkit-mask: var(--icon-search) no-repeat center / contain;
+  mask: var(--icon-search) no-repeat center / contain;
+  --icon-search: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M12.2 13.6a7 7 0 1 1 1.4-1.4l4.6 4.6-1.4 1.4zM12 7.5A4.5 4.5 0 1 0 7.5 12A4.5 4.5 0 0 0 12 7.5"/></svg>');
+}
+.header-search input[type="search"] {
+  width: 100%; padding: 0.45rem 0.6rem 0.45rem 2.1rem; font: inherit;
+  color: var(--color-base); background: var(--bg-page);
+  border: 1px solid var(--border-base); border-radius: 2px;
+}
+.header-search input[type="search"]::placeholder { color: var(--color-subtle); }
 .search-results {
-  position: absolute; top: 100%; right: 0; z-index: 20; margin: 2px 0 0; padding: 0;
-  list-style: none; width: 26em; max-width: 88vw; max-height: 60vh; overflow-y: auto;
-  background: var(--body-bg); border: 1px solid var(--border); border-radius: 2px;
-  box-shadow: 0 3px 9px rgba(0,0,0,0.18);
+  position: absolute; top: calc(100% + 2px); left: 0; right: 0; z-index: 40;
+  margin: 0; padding: 0; list-style: none; max-height: 70vh; overflow-y: auto;
+  background: var(--bg-page); border: 1px solid var(--border-base); border-radius: 2px;
+  box-shadow: 0 3px 9px var(--shadow-drop);
 }
-.search-results li { border-bottom: 1px solid var(--shade); }
+.search-results li { border-bottom: 1px solid var(--border-muted); }
 .search-results li:last-child { border-bottom: 0; }
-.search-results a { display: block; padding: 0.45em 0.6em; text-decoration: none; color: var(--text); }
-.search-results a:hover, .search-results li.active a { background: var(--panel-bg); }
-.search-results .r-title { color: var(--link); font-weight: bold; }
-.search-results .r-path, .search-results .r-snippet { display: block; color: var(--text-muted); font-size: 0.85em; }
+.search-results a { display: block; padding: 0.45rem 0.7rem; color: var(--color-base); }
+.search-results a:hover, .search-results li.active a { background: var(--bg-container); text-decoration: none; }
+.search-results .r-title { color: var(--color-link); font-weight: bold; }
+.search-results .r-path, .search-results .r-snippet { display: block; color: var(--color-subtle); font-size: 0.8125rem; }
 .search-results .r-snippet mark { background: #fc3; color: #000; }
-.search-results .r-empty { padding: 0.6em; color: var(--text-muted); }
+.search-results .r-empty { padding: 0.6rem 0.7rem; color: var(--color-subtle); }
+
+/* ---------- left column: menu + sticky contents ---------- */
+.column-start { position: sticky; top: 4.1rem; padding-top: 1.25rem; font-size: 0.8125rem; }
+.main-menu { padding-bottom: 1rem; }
+body.menu-hidden .main-menu { display: none; }
+.portal { margin-bottom: 1.1rem; }
+.portal h3 {
+  margin: 0 0 0.35rem; padding-bottom: 0.25rem; font-size: 0.75rem; font-weight: normal;
+  color: var(--color-subtle); border-bottom: 1px solid var(--border-muted);
+}
+.portal ul { margin: 0; padding: 0; list-style: none; }
+.portal li { margin: 0.3rem 0; line-height: 1.4; }
+.portal .subnav {
+  margin: 0.25rem 0 0.4rem 0.75rem; padding-left: 0.6rem;
+  border-left: 1px solid var(--border-muted);
+}
+.portal li.active > a { font-weight: bold; color: var(--color-base); }
+
+.sidebar-toc { max-height: calc(100vh - 6rem); overflow-y: auto; padding-bottom: 1.5rem; }
+.sidebar-toc-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
+.sidebar-toc-head h2 {
+  margin: 0 0 0.35rem; padding-bottom: 0.25rem; font-size: 0.75rem; font-weight: normal;
+  color: var(--color-subtle); border-bottom: 0;
+}
+.toc-visibility {
+  padding: 0; font: inherit; font-size: 0.75rem; color: var(--color-link);
+  background: none; border: 0; cursor: pointer;
+}
+.toc-list, .toc-sublist { margin: 0; padding: 0; list-style: none; }
+.toc-item { position: relative; padding-right: 1.3rem; }
+.toc-link {
+  display: block; padding: 0.3rem 0.5rem 0.3rem 0.6rem; color: var(--color-link);
+  border-left: 2px solid transparent; line-height: 1.35;
+}
+.toc-link:hover { background: var(--bg-container); text-decoration: none; }
+.toc-item.current > .toc-link {
+  color: var(--color-base); font-weight: bold;
+  border-left-color: var(--accent); background: var(--bg-container);
+}
+.toc-sublist .toc-link { padding-left: 1.4rem; font-size: 0.95em; }
+.toc-sublist .toc-sublist .toc-link { padding-left: 2.2rem; }
+.toc-item[data-expanded="false"] > .toc-sublist { display: none; }
+.toc-expand {
+  position: absolute; top: 0.25rem; right: 0; width: 1.2rem; height: 1.4rem;
+  padding: 0; cursor: pointer; background: none; border: 0; color: var(--color-subtle);
+}
+.toc-expand::before {
+  content: ""; display: block; width: 0; height: 0; margin: 0 auto;
+  border-left: 4px solid currentColor; border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent; transition: transform 0.12s ease-in-out;
+}
+.toc-item[data-expanded="true"] > .toc-expand::before { transform: rotate(90deg); }
+.toc-expand:hover { color: var(--color-base); }
+.sidebar-toc.collapsed .toc-list { display: none; }
+.toc-mobile { display: none; }
 
 /* ---------- tabs ---------- */
-#left-navigation, #right-navigation { display: inline-block; vertical-align: bottom; }
-#right-navigation { float: right; }
-.tabs { list-style: none; margin: 0; padding: 0 0 0 1em; display: flex; gap: 1px; align-items: flex-end; }
-#right-navigation .tabs { padding: 0 1em 0 0; }
-.tabs li {
-  background: var(--panel-bg); border: 1px solid var(--border-accent); border-bottom: none;
-  border-radius: 3px 3px 0 0; font-size: 0.8125em; line-height: 1.4;
+.content-tabs {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 1rem; padding-top: 1.25rem; border-bottom: 1px solid var(--border-base);
 }
-.tabs li > a, .tabs li > span { display: block; padding: 0.45em 0.85em 0.35em; color: var(--link); text-decoration: none; }
-.tabs li.selected { background: var(--body-bg); border-bottom: 1px solid var(--body-bg); margin-bottom: -1px; }
-.tabs li.selected > span { color: var(--text); }
-.tabs li:hover:not(.selected) { background: var(--shade); }
+.tabs { display: flex; margin: 0; padding: 0; list-style: none; gap: 0.15rem; }
+.tabs li { font-size: 0.8125rem; }
+.tabs li > a, .tabs li > span {
+  display: block; padding: 0.4rem 0.7rem; color: var(--color-link);
+  border-bottom: 2px solid transparent;
+}
+.tabs li > a:hover { background: var(--bg-container); text-decoration: none; }
+.tabs li.selected > span { color: var(--color-base); border-bottom-color: var(--accent); font-weight: bold; }
 
-/* ---------- body ---------- */
-.mw-body {
-  clear: both; background: var(--body-bg);
-  border: 1px solid var(--border-accent); border-right-width: 0;
-  padding: 1.1em 1.6em 1.6em; margin-right: 0;
-}
+/* ---------- article body ---------- */
+.mw-body { padding-top: 0.9rem; }
+.content-header { position: relative; }
 .firstHeading {
-  font-family: var(--serif); font-weight: normal; font-size: 1.85em; line-height: 1.3;
-  margin: 0 0 0.15em; padding-bottom: 0.2em; border-bottom: 1px solid var(--border);
+  margin: 0 0 0.15rem; padding-bottom: 0.2rem; font-family: var(--serif);
+  font-weight: normal; font-size: 1.75rem; line-height: 1.3;
+  border-bottom: 1px solid var(--border-base);
 }
-#siteSub { font-size: 0.85em; color: var(--text-muted); margin-bottom: 0.6em; }
-.breadcrumbs { font-size: 0.85em; color: var(--text-muted); margin: -0.2em 0 1em; }
-.crumb-sep { color: var(--border); }
-.mw-parser-output { max-width: 60em; }
+#siteSub { font-size: 0.8125rem; color: var(--color-subtle); }
+.breadcrumbs { margin: 0.5rem 0 0; font-size: 0.8125rem; color: var(--color-subtle); }
+.crumb-sep { color: var(--border-base); }
+.mw-parser-output { margin-top: 1rem; font-size: var(--font-size-content); }
 .mw-parser-output > *:first-child { margin-top: 0; }
-a { color: var(--link); text-decoration: none; }
-a:visited { color: var(--link-visited); }
-a:hover { text-decoration: underline; }
-a:focus-visible, button:focus-visible, summary:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
-a.new, a.new:visited { color: var(--link-new); }
+a.new, a.new:visited { color: var(--color-link-new); }
 a.external::after {
   content: ""; display: inline-block; width: 0.75em; height: 0.75em; margin-left: 0.25em;
   background: currentColor; opacity: 0.55; vertical-align: baseline;
   -webkit-mask: var(--ext) no-repeat center / contain; mask: var(--ext) no-repeat center / contain;
   --ext: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M6 1h5v5H9.5V3.5L5 8 4 7l4.5-4.5H6zM2 2h3v1.5H3.5v5h5V7H10v3H2z"/></svg>');
 }
-h1, h2, h3, h4, h5, h6 { font-weight: bold; line-height: 1.3; margin: 1.4em 0 0.4em; }
+.mw-parser-output h1, .mw-parser-output h2, .mw-parser-output h3,
+.mw-parser-output h4, .mw-parser-output h5, .mw-parser-output h6 {
+  margin: 1.5em 0 0.4em; line-height: 1.3; font-weight: bold;
+}
 .mw-parser-output h1, .mw-parser-output h2 {
   font-family: var(--serif); font-weight: normal;
-  border-bottom: 1px solid var(--border); padding-bottom: 0.17em;
+  padding-bottom: 0.2em; border-bottom: 1px solid var(--border-base);
 }
 .mw-parser-output h1 { font-size: 1.7em; }
 .mw-parser-output h2 { font-size: 1.5em; }
@@ -1638,12 +1816,12 @@ h1, h2, h3, h4, h5, h6 { font-weight: bold; line-height: 1.3; margin: 1.4em 0 0.
 .mw-parser-output h4 { font-size: 1.05em; }
 .mw-parser-output h5, .mw-parser-output h6 { font-size: 1em; }
 .heading-anchor {
-  margin-left: 0.4em; font-size: 0.7em; opacity: 0; text-decoration: none;
-  vertical-align: middle; transition: opacity 0.12s ease-in;
+  margin-left: 0.4em; font-size: 0.7em; opacity: 0; vertical-align: middle;
+  transition: opacity 0.12s ease-in;
 }
 h1:hover .heading-anchor, h2:hover .heading-anchor, h3:hover .heading-anchor,
-h4:hover .heading-anchor, .heading-anchor:focus { opacity: 0.6; }
-p { margin: 0.55em 0 0.85em; }
+h4:hover .heading-anchor, h5:hover .heading-anchor, .heading-anchor:focus { opacity: 0.6; }
+p { margin: 0.5em 0 0.85em; }
 ul, ol { margin: 0.35em 0 0.9em 1.6em; padding: 0; }
 li { margin-bottom: 0.15em; }
 li.task-list-item, li:has(> .task-checkbox) { list-style: none; margin-left: -1.35em; }
@@ -1651,173 +1829,210 @@ li.task-list-item, li:has(> .task-checkbox) { list-style: none; margin-left: -1.
 dl { margin: 0.4em 0 0.9em; }
 dt { font-weight: bold; }
 dd { margin: 0 0 0.4em 1.6em; }
-hr { height: 1px; border: 0; background: var(--border-soft); margin: 1.4em 0; }
+hr { height: 1px; border: 0; background: var(--border-muted); margin: 1.4em 0; }
 blockquote {
-  margin: 0.9em 0; padding: 0.4em 1em; border-left: 4px solid var(--shade);
-  color: var(--text-muted);
+  margin: 0.9em 0; padding: 0.4em 1em; color: var(--color-subtle);
+  border-left: 4px solid var(--border-muted);
 }
 blockquote p:first-child { margin-top: 0; }
 blockquote p:last-child { margin-bottom: 0; }
 code, kbd, samp { font-family: var(--mono); font-size: 0.9em; }
 :not(pre) > code {
-  background: var(--panel-bg); border: 1px solid var(--border-soft);
-  border-radius: 2px; padding: 0.06em 0.35em; color: #b32d2e;
+  padding: 0.06em 0.35em; color: #b32d2e; background: var(--bg-code);
+  border: 1px solid var(--border-muted); border-radius: 2px;
 }
 html[data-theme="dark"] :not(pre) > code { color: #ffb4a8; }
-pre {
-  background: var(--panel-bg); border: 1px solid var(--border-soft); border-radius: 2px;
-  padding: 0.8em 1em; margin: 0.9em 0; overflow-x: auto; line-height: 1.45;
-  font-family: var(--mono); font-size: 0.86em; tab-size: 4;
+@media screen and (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) :not(pre) > code { color: #ffb4a8; }
 }
-pre code { background: none; border: 0; padding: 0; color: inherit; font-size: 1em; }
+pre {
+  margin: 0.9em 0; padding: 0.8em 1em; overflow-x: auto; line-height: 1.45; tab-size: 4;
+  font-family: var(--mono); font-size: 0.86em; background: var(--bg-code);
+  border: 1px solid var(--border-muted); border-radius: 2px;
+}
+pre code { padding: 0; color: inherit; background: none; border: 0; font-size: 1em; }
 img { max-width: 100%; height: auto; }
-.mw-parser-output figure { margin: 0.9em 0; }
-.mw-parser-output figcaption { font-size: 0.88em; color: var(--text-muted); }
+figure { margin: 0.9em 0; }
+figcaption { font-size: 0.9em; color: var(--color-subtle); }
 
 /* ---------- tables ---------- */
-table { border-collapse: collapse; margin: 0.9em 0; max-width: 100%; }
-.mw-parser-output table:not(.wikitable):not(.infobox) th,
-.mw-parser-output table:not(.wikitable):not(.infobox) td { padding: 0.3em 0.6em; }
-table.wikitable {
-  background: var(--body-bg); border: 1px solid var(--border);
-  color: var(--text); font-size: 0.95em;
-}
+.table-scroll { overflow-x: auto; margin: 0.9em 0; }
+table { border-collapse: collapse; max-width: 100%; }
+table.wikitable { background: var(--bg-page); color: var(--color-base); border: 1px solid var(--border-base); }
 table.wikitable > * > tr > th, table.wikitable > * > tr > td {
-  border: 1px solid var(--border-soft); padding: 0.35em 0.7em;
+  padding: 0.35em 0.7em; border: 1px solid var(--border-subtle);
 }
-table.wikitable > * > tr > th { background: var(--shade); text-align: center; font-weight: bold; }
-table.wikitable caption { font-weight: bold; padding-bottom: 0.3em; }
+table.wikitable > * > tr > th { background: var(--bg-interactive); font-weight: bold; text-align: center; }
+table.wikitable caption { padding-bottom: 0.3em; font-weight: bold; }
 .mw-parser-output .infobox {
   float: right; clear: right; width: 22em; max-width: 90%; margin: 0 0 1em 1.4em;
-  background: var(--panel-bg); border: 1px solid var(--border-soft); font-size: 0.88em;
+  font-size: 0.9em; background: var(--bg-container); border: 1px solid var(--border-subtle);
 }
 .mw-parser-output .infobox th, .mw-parser-output .infobox td {
-  border-bottom: 1px solid var(--shade); padding: 0.3em 0.6em; text-align: left; vertical-align: top;
+  padding: 0.3em 0.6em; text-align: left; vertical-align: top;
+  border-bottom: 1px solid var(--border-muted);
 }
-.table-scroll { overflow-x: auto; }
+.mw-parser-output table:not(.wikitable):not(.infobox) th,
+.mw-parser-output table:not(.wikitable):not(.infobox) td { padding: 0.3em 0.6em; }
 
-/* ---------- contents box ---------- */
-.toc {
-  display: table; background: var(--panel-bg); border: 1px solid var(--border-soft);
-  border-radius: 2px; padding: 0.6em 1.1em 0.7em 0.7em; margin: 1em 0 1.2em;
-  font-size: 0.95em;
+/* ---------- right column ---------- */
+.column-end { position: sticky; top: 4.1rem; padding-top: 1.25rem; font-size: 0.8125rem; }
+.column-panel { margin-bottom: 1.25rem; }
+.column-panel h3 {
+  margin: 0 0 0.4rem; padding-bottom: 0.25rem; font-size: 0.75rem; font-weight: normal;
+  color: var(--color-subtle); border-bottom: 1px solid var(--border-muted);
 }
-.toctitle { display: flex; align-items: baseline; gap: 0.5em; text-align: center; }
-.toctitle h2 {
-  display: inline; font-family: var(--serif); font-size: 1.05em; font-weight: bold;
-  border: 0; margin: 0; padding: 0;
+.column-panel ul { margin: 0; padding: 0; list-style: none; }
+.column-panel li { margin: 0.3rem 0; }
+.appearance-group { margin-bottom: 0.7rem; }
+.appearance-label { display: block; margin-bottom: 0.25rem; color: var(--color-subtle); }
+.appearance-options { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.appearance-options button {
+  padding: 0.25rem 0.5rem; font: inherit; font-size: 0.75rem; cursor: pointer;
+  color: var(--color-link); background: var(--bg-page);
+  border: 1px solid var(--border-base); border-radius: 2px;
 }
-.toctogglespan { font-size: 0.85em; color: var(--text-muted); }
-.toctogglebutton {
-  background: none; border: 0; padding: 0; font: inherit; color: var(--link); cursor: pointer;
+.appearance-options button:hover { background: var(--bg-container); }
+.appearance-options button[aria-checked="true"] {
+  color: var(--bg-page); background: var(--accent); border-color: var(--accent);
 }
-.toc ul { list-style: none; margin: 0.3em 0 0 0; padding: 0; }
-.toc ul ul { margin-left: 1.4em; }
-.toc li { margin: 0.15em 0; }
-.toc .tocnumber { color: var(--text-muted); padding-right: 0.35em; }
-.toc.collapsed .toc-list { display: none; }
+html[data-theme="dark"] .appearance-options button[aria-checked="true"] { color: #101418; }
 
 /* ---------- generated list pages ---------- */
-.page-list { list-style: none; margin-left: 0; }
+.page-list { margin-left: 0; list-style: none; }
 .page-list li { padding-left: 1em; text-indent: -1em; }
-.page-list li::before { content: "\\2022"; color: var(--border); padding-right: 0.5em; }
+.page-list li::before { content: "\2022"; padding-right: 0.5em; color: var(--border-base); }
 .page-list.columns { columns: 3 15em; column-gap: 2em; }
-.page-blurb { color: var(--text-muted); font-size: 0.92em; }
+.page-blurb { color: var(--color-subtle); font-size: 0.92em; }
 .letter-nav {
-  background: var(--panel-bg); border: 1px solid var(--border-soft); border-radius: 2px;
-  padding: 0.5em 0.7em; margin: 0.8em 0 1.2em; line-height: 2;
+  margin: 0.8em 0 1.2em; padding: 0.5em 0.7em; line-height: 2;
+  background: var(--bg-container); border: 1px solid var(--border-muted); border-radius: 2px;
 }
 .letter-nav a { display: inline-block; min-width: 1.6em; text-align: center; }
 .mainpage-banner {
-  background: var(--panel-bg); border: 1px solid var(--border-accent); border-radius: 2px;
-  padding: 0.9em 1.2em; margin-bottom: 1.2em;
+  margin-bottom: 1.2em; padding: 0.9em 1.2em;
+  background: var(--bg-container); border: 1px solid var(--border-muted); border-radius: 2px;
 }
 .mainpage-banner h2 { margin-top: 0.1em; border: 0; font-family: var(--serif); font-weight: normal; }
-.mainpage-columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(18em, 1fr)); gap: 1.2em; }
-.mainpage-box { background: var(--body-bg); border: 1px solid var(--border-soft); border-radius: 2px; padding: 0.4em 1.1em 1em; }
-.mainpage-box h2 { margin-top: 0.6em; font-size: 1.25em; }
-.mainpage-footnote { color: var(--text-muted); margin-top: 1.4em; }
-.empty { color: var(--text-muted); font-style: italic; }
-
-/* ---------- footer areas ---------- */
-.catlinks {
-  clear: both; margin: 1.6em 0 0; padding: 0.45em 0.7em;
-  background: var(--panel-bg); border: 1px solid var(--border-soft); border-radius: 2px;
-  font-size: 0.9em;
+.mainpage-columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(17em, 1fr)); gap: 1.2em; }
+.mainpage-box {
+  padding: 0.4em 1.1em 1em; background: var(--bg-page);
+  border: 1px solid var(--border-muted); border-radius: 2px;
 }
-.catlinks ul { display: inline; list-style: none; margin: 0; padding: 0; }
-.catlinks li { display: inline-block; margin: 0; padding: 0 0.6em; border-left: 1px solid var(--border-soft); }
-.catlinks li:first-child { border-left: 0; padding-left: 0.3em; }
+.mainpage-box h2 { margin-top: 0.6em; font-size: 1.25em; }
+.mainpage-footnote { margin-top: 1.4em; color: var(--color-subtle); }
+.empty { color: var(--color-subtle); font-style: italic; }
+
+/* ---------- page footers ---------- */
+.catlinks {
+  clear: both; margin-top: 1.6em; padding: 0.45em 0.7em; font-size: 0.9em;
+  background: var(--bg-container); border: 1px solid var(--border-muted); border-radius: 2px;
+}
+.catlinks ul { display: inline; margin: 0; padding: 0; list-style: none; }
+.catlinks li {
+  display: inline-block; margin: 0; padding: 0 0.6em;
+  border-left: 1px solid var(--border-subtle);
+}
+.catlinks li:first-child { padding-left: 0.3em; border-left: 0; }
 .catlinks-label { font-weight: bold; }
 .whatlinkshere {
-  clear: both; margin: 1em 0 0; padding: 0.4em 0.7em; font-size: 0.9em;
-  background: var(--panel-bg); border: 1px solid var(--border-soft); border-radius: 2px;
+  clear: both; margin-top: 1em; padding: 0.4em 0.7em; font-size: 0.9em;
+  background: var(--bg-container); border: 1px solid var(--border-muted); border-radius: 2px;
 }
-.whatlinkshere summary { cursor: pointer; color: var(--link); }
+.whatlinkshere summary { cursor: pointer; color: var(--color-link); }
 .whatlinkshere ul { margin-top: 0.5em; }
 .printfooter { display: none; }
-#footer {
-  clear: both; margin: 0 0 2em; padding: 0.8em 1.6em 1em;
-  border-top: 1px solid var(--border-soft);
-  color: var(--text-muted); font-size: 0.8125em;
+.site-footer {
+  margin-top: 1rem; padding: 1rem 1.75rem 1.5rem; font-size: 0.8125rem;
+  color: var(--color-subtle); background: var(--bg-container);
+  border-top: 1px solid var(--border-muted);
 }
-#footer p { margin: 0.3em 0; }
-.footer-links { list-style: none; margin: 0.4em 0 0; padding: 0; }
-.footer-links li { display: inline-block; margin-right: 1.2em; }
+.site-footer p { margin: 0.3rem 0; }
+.footer-links { margin: 0.5rem 0 0; padding: 0; list-style: none; }
+.footer-links li { display: inline-block; margin-right: 1.2rem; }
+
 .visually-hidden {
   position: absolute !important; width: 1px; height: 1px; margin: -1px;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
 }
 .skip-link:focus {
   position: static !important; width: auto; height: auto; margin: 0; clip: auto;
-  display: inline-block; padding: 0.4em 0.8em; background: var(--body-bg);
+  display: inline-block; padding: 0.4em 0.8em; background: var(--bg-page);
 }
 
 /* ---------- responsive ---------- */
-@media (max-width: 900px) {
-  .layout { display: block; }
-  .sidebar {
-    display: none; width: auto; padding: 0.8em 1em;
-    background: var(--panel-bg); border-bottom: 1px solid var(--border-soft);
+@media screen and (max-width: 1200px) {
+  :root { --col-end: 0px; --gap-col: 1.5rem; }
+  .page-grid { grid-template-columns: var(--col-start) minmax(0, 1fr); }
+  .column-end {
+    grid-column: 1 / -1; position: static; display: flex; flex-wrap: wrap; gap: 2rem;
+    margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border-muted);
   }
-  body.nav-open .sidebar { display: block; }
-  #p-logo img { width: 56px; height: 56px; }
-  .site-name { margin-bottom: 0.8em; }
-  #mw-head { justify-content: space-between; padding: 0.5em 0.8em 0; }
-  .menu-toggle {
-    display: inline-block; font-size: 1.3em; line-height: 1; padding: 0.2em 0.5em;
-    color: var(--text); background: var(--panel-bg);
-    border: 1px solid var(--border-soft); border-radius: 2px; cursor: pointer;
+  .column-end .column-panel { flex: 1 1 14rem; margin-bottom: 0; }
+}
+@media screen and (max-width: 1000px) {
+  .page-container { border: 0; }
+  .page-grid { grid-template-columns: minmax(0, 1fr); padding: 0 1rem 1.5rem; }
+  .site-header { padding: 0.5rem 1rem; gap: 0.6rem; }
+  .brand-name { font-size: 1.1rem; }
+  .column-start {
+    position: static; grid-row: 1; padding-top: 0;
   }
-  .mw-body { border-left: 0; border-right: 0; padding: 0.9em 1em 1.2em; }
-  #left-navigation, #right-navigation { float: none; display: block; }
-  #right-navigation .tabs { padding-left: 1em; }
+  .main-menu {
+    display: none; margin-top: 0.75rem; padding: 0.75rem 1rem;
+    background: var(--bg-container); border: 1px solid var(--border-muted); border-radius: 2px;
+  }
+  body.nav-open .main-menu { display: block; }
+  body.menu-hidden .main-menu { display: none; }
+  .sidebar-toc {
+    display: none; max-height: 60vh; margin-top: 0.75rem; padding: 0.5rem 0.75rem;
+    background: var(--bg-container); border: 1px solid var(--border-muted); border-radius: 2px;
+  }
+  body.toc-open .sidebar-toc { display: block; }
+  .column-content { max-width: none; }
+  .content-tabs { padding-top: 0.75rem; }
+  .toc-mobile {
+    display: inline-flex; align-items: center; gap: 0.35rem; margin-top: 0.6rem;
+    padding: 0.3rem 0.7rem; font: inherit; font-size: 0.8125rem; cursor: pointer;
+    color: var(--color-link); background: var(--bg-page);
+    border: 1px solid var(--border-base); border-radius: 2px;
+  }
+  .toc-mobile::after {
+    content: ""; width: 0; height: 0; border-top: 4px solid currentColor;
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+  }
   .page-list.columns { columns: 1; }
-  #footer { padding: 0.8em 1em; }
+  .site-footer { padding: 1rem; }
 }
 @media print {
-  #mw-page-base, .sidebar, #mw-head, #left-navigation, #right-navigation,
-  .toctogglespan, .heading-anchor, .whatlinkshere, .footer-links, .skip-link { display: none !important; }
+  .site-header, .column-start, .column-end, .content-tabs, .footer-links,
+  .skip-link, .heading-anchor, .whatlinkshere, .toc-mobile { display: none !important; }
   body { background: #fff; font-size: 11pt; }
-  .mw-body { border: 0; padding: 0; }
-  .printfooter { display: block; margin-top: 1.5em; color: #555; font-size: 0.85em; }
+  .page-container { max-width: none; border: 0; }
+  .page-grid { display: block; padding: 0; }
+  .column-content { max-width: none; }
+  .site-footer { background: none; border-top: 1px solid #ccc; color: #555; }
+  .printfooter { display: block; margin-top: 1.5em; font-size: 0.85em; color: #555; }
   a { color: #000; text-decoration: underline; }
-  pre, blockquote, table { break-inside: avoid; }
+  pre, blockquote, table, figure { break-inside: avoid; }
 }
-@media (prefers-reduced-motion: reduce) {
+@media screen and (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
+  html { scroll-behavior: auto !important; }
 }
 """
 
-SCRIPT = r"""/* mdwiki - client-side search, theme toggle, small niceties. No dependencies, file:// safe. */
+SCRIPT = r"""/* mdwiki - search, contents behaviour, appearance controls.
+   No dependencies, no network, safe to run from file://. */
 (function () {
   "use strict";
+  var root = document.documentElement;
   var body = document.body;
   var base = body.getAttribute("data-base") || "";
-  var index = window.MDWIKI_INDEX || [];
   var currentPage = body.getAttribute("data-page") || "";
+  var index = window.MDWIKI_INDEX || [];
 
-  /* ---- storage (localStorage can throw on file:// in some browsers) ---- */
+  /* ---- preferences (localStorage can throw on file:// in some browsers) ---- */
   function readPref(key) {
     try { return window.localStorage.getItem(key); } catch (e) { return null; }
   }
@@ -1825,20 +2040,42 @@ SCRIPT = r"""/* mdwiki - client-side search, theme toggle, small niceties. No de
     try { window.localStorage.setItem(key, value); } catch (e) { /* ignore */ }
   }
 
-  /* ---- theme ---- */
-  var saved = readPref("mdwiki-theme");
-  if (saved === "dark" || saved === "light") {
-    document.documentElement.setAttribute("data-theme", saved);
+  var SETTINGS = {
+    theme: { attr: "data-theme", values: ["auto", "light", "dark"] },
+    textsize: { attr: "data-textsize", values: ["small", "standard", "large"] },
+    width: { attr: "data-width", values: ["standard", "wide"] }
+  };
+
+  function applySetting(key, value, remember) {
+    var setting = SETTINGS[key];
+    if (!setting || setting.values.indexOf(value) < 0) return;
+    if (key === "theme" && value === "auto") {
+      root.removeAttribute(setting.attr);
+    } else {
+      root.setAttribute(setting.attr, value);
+    }
+    if (remember) writePref("mdwiki-" + key, value);
+    var buttons = document.querySelectorAll('[data-set="' + key + '"]');
+    Array.prototype.forEach.call(buttons, function (button) {
+      button.setAttribute("aria-checked", button.getAttribute("data-value") === value ? "true" : "false");
+    });
   }
+
+  Object.keys(SETTINGS).forEach(function (key) {
+    var stored = readPref("mdwiki-" + key);
+    if (stored) {
+      applySetting(key, stored, false);
+    } else if (key === "theme") {
+      applySetting("theme", root.getAttribute("data-theme") || "auto", false);
+    }
+  });
+
   function toggleTheme() {
-    var root = document.documentElement;
     var explicit = root.getAttribute("data-theme");
     var dark = explicit
       ? explicit === "dark"
       : window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-    var next = dark ? "light" : "dark";
-    root.setAttribute("data-theme", next);
-    writePref("mdwiki-theme", next);
+    applySetting("theme", dark ? "light" : "dark", true);
   }
 
   /* ---- search ---- */
@@ -1850,6 +2087,10 @@ SCRIPT = r"""/* mdwiki - client-side search, theme toggle, small niceties. No de
     return String(text).replace(/[&<>"']/g, function (ch) {
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch];
     });
+  }
+
+  function pageHref(url) {
+    return base + url.split("/").map(encodeURIComponent).join("/");
   }
 
   function score(record, terms) {
@@ -1907,7 +2148,7 @@ SCRIPT = r"""/* mdwiki - client-side search, theme toggle, small niceties. No de
     });
   }
 
-  function hide() {
+  function hideResults() {
     if (!results) return;
     results.hidden = true;
     results.innerHTML = "";
@@ -1917,21 +2158,18 @@ SCRIPT = r"""/* mdwiki - client-side search, theme toggle, small niceties. No de
 
   function render(query) {
     if (!results) return;
+    if (!query.trim()) return hideResults();
     var matches = search(query);
-    if (!query.trim()) return hide();
     if (!matches.length) {
       results.innerHTML = '<li class="r-empty">No pages match &ldquo;' + escapeHtml(query) + '&rdquo;.</li>';
-      results.hidden = false;
-      if (input) input.setAttribute("aria-expanded", "true");
-      return;
+    } else {
+      results.innerHTML = matches.map(function (match, n) {
+        return '<li role="option" data-n="' + n + '"><a href="' + escapeHtml(pageHref(match.record.u)) + '">' +
+          '<span class="r-title">' + escapeHtml(match.record.t) + "</span>" +
+          '<span class="r-path">' + escapeHtml(match.record.u) + "</span>" +
+          '<span class="r-snippet">' + match.snippet + "</span></a></li>";
+      }).join("");
     }
-    results.innerHTML = matches.map(function (match, n) {
-      var href = base + match.record.u.split("/").map(encodeURIComponent).join("/");
-      return '<li role="option" data-n="' + n + '"><a href="' + escapeHtml(href) + '">' +
-        '<span class="r-title">' + escapeHtml(match.record.t) + "</span>" +
-        '<span class="r-path">' + escapeHtml(match.record.u) + "</span>" +
-        '<span class="r-snippet">' + match.snippet + "</span></a></li>";
-    }).join("");
     results.hidden = false;
     active = -1;
     if (input) input.setAttribute("aria-expanded", "true");
@@ -1961,10 +2199,10 @@ SCRIPT = r"""/* mdwiki - client-side search, theme toggle, small niceties. No de
         var items = results ? results.querySelectorAll("li[data-n] a") : [];
         var target = items[active > -1 ? active : 0];
         if (target) { event.preventDefault(); window.location.href = target.getAttribute("href"); }
-      } else if (event.key === "Escape") { hide(); input.blur(); }
+      } else if (event.key === "Escape") { hideResults(); input.blur(); }
     });
     document.addEventListener("click", function (event) {
-      if (!event.target.closest || !event.target.closest("#p-search")) hide();
+      if (!event.target.closest || !event.target.closest("#p-search")) hideResults();
     });
     document.addEventListener("keydown", function (event) {
       var typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
@@ -1976,27 +2214,113 @@ SCRIPT = r"""/* mdwiki - client-side search, theme toggle, small niceties. No de
     });
   }
 
+  /* ---- contents ---- */
+  var toc = document.getElementById("toc");
+
+  function expandAncestors(item) {
+    var node = item ? item.parentNode : null;
+    while (node && node !== toc) {
+      if (node.classList && node.classList.contains("toc-item")) {
+        node.setAttribute("data-expanded", "true");
+        var button = node.querySelector(":scope > .toc-expand");
+        if (button) button.setAttribute("aria-expanded", "true");
+      }
+      node = node.parentNode;
+    }
+  }
+
+  function markCurrent(id) {
+    if (!toc) return;
+    var items = toc.querySelectorAll(".toc-item");
+    var match = null;
+    Array.prototype.forEach.call(items, function (item) {
+      var link = item.querySelector(".toc-link");
+      var href = link ? link.getAttribute("href") : "";
+      var isMatch = href === "#" + id;
+      item.classList.toggle("current", isMatch);
+      if (isMatch) match = item;
+    });
+    if (match) expandAncestors(match);
+  }
+
+  if (toc) {
+    if (readPref("mdwiki-toc") === "collapsed") {
+      toc.classList.add("collapsed");
+      var visibility = toc.querySelector(".toc-visibility");
+      if (visibility) {
+        visibility.textContent = "show";
+        visibility.setAttribute("aria-expanded", "false");
+      }
+    }
+    toc.addEventListener("click", function (event) {
+      var button = event.target.closest ? event.target.closest(".toc-expand") : null;
+      if (!button) return;
+      event.preventDefault();
+      var item = button.parentNode;
+      var expanded = item.getAttribute("data-expanded") === "true";
+      item.setAttribute("data-expanded", expanded ? "false" : "true");
+      button.setAttribute("aria-expanded", expanded ? "false" : "true");
+    });
+
+    /* highlight the section currently in view */
+    var headings = document.querySelectorAll("#mw-content-text h1[id], #mw-content-text h2[id], " +
+      "#mw-content-text h3[id], #mw-content-text h4[id], #mw-content-text h5[id], #mw-content-text h6[id]");
+    if (headings.length && window.IntersectionObserver) {
+      var seen = [];
+      var observer = new window.IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          var id = entry.target.id;
+          var at = seen.indexOf(id);
+          if (entry.isIntersecting) {
+            if (at < 0) seen.push(id);
+          } else if (at > -1) {
+            seen.splice(at, 1);
+          }
+        });
+        if (seen.length) markCurrent(seen[0]);
+      }, { rootMargin: "-80px 0px -70% 0px" });
+      Array.prototype.forEach.call(headings, function (heading) { observer.observe(heading); });
+    }
+    if (window.location.hash.length > 1) {
+      markCurrent(decodeURIComponent(window.location.hash.slice(1)));
+    }
+  }
+
   /* ---- actions ---- */
   function randomPage() {
     var options = index.filter(function (record) { return record.u !== currentPage; });
     if (!options.length) options = index;
     if (!options.length) return;
-    var pick = options[Math.floor(Math.random() * options.length)];
-    window.location.href = base + pick.u.split("/").map(encodeURIComponent).join("/");
+    window.location.href = pageHref(options[Math.floor(Math.random() * options.length)].u);
   }
 
   document.addEventListener("click", function (event) {
-    var trigger = event.target.closest ? event.target.closest("[data-action]") : null;
+    var trigger = event.target.closest ? event.target.closest("[data-action], [data-set]") : null;
     if (!trigger) return;
+    var setting = trigger.getAttribute("data-set");
+    if (setting) {
+      event.preventDefault();
+      applySetting(setting, trigger.getAttribute("data-value"), true);
+      return;
+    }
     var action = trigger.getAttribute("data-action");
     if (action === "theme") { event.preventDefault(); toggleTheme(); }
     else if (action === "random") { event.preventDefault(); randomPage(); }
     else if (action === "print") { event.preventDefault(); window.print(); }
-    else if (action === "menu") { event.preventDefault(); body.classList.toggle("nav-open"); }
-    else if (action === "search") { event.preventDefault(); if (input) { render(input.value); input.focus(); } }
+    else if (action === "menu") {
+      event.preventDefault();
+      var narrow = window.matchMedia && window.matchMedia("(max-width: 1000px)").matches;
+      var shown = narrow ? body.classList.toggle("nav-open") : !body.classList.toggle("menu-hidden");
+      trigger.setAttribute("aria-expanded", shown ? "true" : "false");
+      if (!narrow) writePref("mdwiki-menu", shown ? "open" : "hidden");
+    }
+    else if (action === "mobile-toc") {
+      event.preventDefault();
+      var open = body.classList.toggle("toc-open");
+      trigger.setAttribute("aria-expanded", open ? "true" : "false");
+    }
     else if (action === "toggle-toc") {
       event.preventDefault();
-      var toc = document.getElementById("toc");
       if (!toc) return;
       var collapsed = toc.classList.toggle("collapsed");
       trigger.textContent = collapsed ? "show" : "hide";
@@ -2005,11 +2329,20 @@ SCRIPT = r"""/* mdwiki - client-side search, theme toggle, small niceties. No de
     }
   });
 
-  var toc = document.getElementById("toc");
-  if (toc && readPref("mdwiki-toc") === "collapsed") {
-    toc.classList.add("collapsed");
-    var button = toc.querySelector(".toctogglebutton");
-    if (button) { button.textContent = "show"; button.setAttribute("aria-expanded", "false"); }
+  if (readPref("mdwiki-menu") === "hidden") {
+    body.classList.add("menu-hidden");
+    var menuButton = document.querySelector('[data-action="menu"]');
+    if (menuButton) menuButton.setAttribute("aria-expanded", "false");
+  }
+
+  /* ---- header shadow once scrolled ---- */
+  var header = document.querySelector(".site-header");
+  if (header) {
+    var onScroll = function () {
+      header.classList.toggle("scrolled", window.pageYOffset > 8);
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
   }
 
   /* ---- task lists lose their bullet (fallback for browsers without :has) ---- */
@@ -2051,6 +2384,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="folder to write the site into (default: ./outputs)")
     parser.add_argument("--site-name", default=None, help="wiki name shown in the sidebar and titles")
     parser.add_argument("--tagline", default=None, help="text under each page title")
+    parser.add_argument("--brand-tagline", default="", metavar="TEXT",
+                        help="small line under the wiki name in the header (e.g. 'The free encyclopedia')")
     parser.add_argument("--lang", default="en", help="value for the html lang attribute (default: en)")
     parser.add_argument("--theme", choices=["auto", "light", "dark"], default="auto",
                         help="default colour theme; 'auto' follows the operating system (default: auto)")
